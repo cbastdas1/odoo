@@ -8,7 +8,12 @@ import weUtils from "@web_editor/js/common/utils";
 import options from "@web_editor/js/editor/snippets.options";
 import { NavbarLinkPopoverWidget } from "@website/js/widgets/link_popover_widget";
 import wUtils from "@website/js/utils";
-import {isImageCorsProtected, isImageSupportedForStyle} from "@web_editor/js/editor/image_processing";
+import {
+    applyModifications,
+    isImageCorsProtected,
+    isImageSupportedForStyle,
+    loadImageInfo,
+} from "@web_editor/js/editor/image_processing";
 import "@website/snippets/s_popup/options";
 import { range } from "@web/core/utils/numbers";
 import { _t } from "@web/core/l10n/translation";
@@ -23,7 +28,6 @@ import {
 import { renderToElement, renderToFragment } from "@web/core/utils/render";
 import { browser } from "@web/core/browser/browser";
 import {
-    applyTextHighlight,
     removeTextHighlight,
     drawTextHighlightSVG,
 } from "@website/js/text_processing";
@@ -247,7 +251,7 @@ const FontFamilyPickerUserValueWidget = SelectUserValueWidget.extend({
             googleLocalFontsEls.forEach((el, index) => {
                 $(el).append(renderToFragment('website.delete_google_font_btn', {
                     index: index,
-                    local: true,
+                    local: "true",
                 }));
             });
         }
@@ -657,6 +661,7 @@ options.userValueWidgetsRegistry['we-gpspicker'] = GPSPicker;
 options.Class.include({
     custom_events: Object.assign({}, options.Class.prototype.custom_events || {}, {
         'google_fonts_custo_request': '_onGoogleFontsCustoRequest',
+        'request_save': '_onSaveRequest',
     }),
     specialCheckAndReloadMethodsNames: ['customizeWebsiteViews', 'customizeWebsiteVariable', 'customizeWebsiteColor'],
 
@@ -727,28 +732,10 @@ options.Class.include({
         }
         for (const widget of widgets) {
             const methodsNames = widget.getMethodsNames();
-            const specialMethodsNames = [];
-            // If it's a pageOption, it's most likely to need to reload, so check the widgets.
-            if (this.data.pageOptions) {
-                specialMethodsNames.push(methodsNames);
-            } else {
-                for (const methodName of methodsNames) {
-                    if (this.specialCheckAndReloadMethodsNames.includes(methodName)) {
-                        specialMethodsNames.push(methodName);
-                    }
-                }
-            }
-            if (!specialMethodsNames.length) {
-                continue;
-            }
-            let paramsReload = false;
-            for (const methodName of specialMethodsNames) {
-                if (widget.getMethodsParams(methodName).reload) {
-                    paramsReload = true;
-                    break;
-                }
-            }
-            if (paramsReload) {
+            const methodNamesToCheck = this.data.pageOptions
+                ? methodsNames
+                : methodsNames.filter(m => this.specialCheckAndReloadMethodsNames.includes(m));
+            if (methodNamesToCheck.some(m => widget.getMethodsParams(m).reload)) {
                 return true;
             }
         }
@@ -1030,6 +1017,22 @@ options.Class.include({
             reloadEditor: true,
         });
     },
+    /**
+     * This handler prevents reloading the page twice with a `request_save`
+     * event when a widget is already going to handle reloading the page.
+     *
+     * @param {OdooEvent} ev
+     */
+    _onSaveRequest(ev) {
+        // If a widget requires a reload, any subsequent request to save is
+        // useless, as the reload will save the page anyway. It can cause
+        // a race condition where the wysiwyg attempts to reload the page twice,
+        // so ignore the request.
+        if (this.__willReload) {
+            ev.stopPropagation();
+            return;
+        }
+    }
 });
 
 function _getLastPreFilterLayerElement($el) {
@@ -1481,8 +1484,8 @@ options.registry.OptionsTab = options.Class.extend({
      */
     async customizeButtonStyle(previewMode, widgetValue, params) {
         await this._customizeWebsiteVariables({
-            [`btn-${params.button}-outline`]: widgetValue === 'outline',
-            [`btn-${params.button}-flat`]: widgetValue === 'flat',
+            [`btn-${params.button}-outline`]: widgetValue === "outline" ? "true" : "false",
+            [`btn-${params.button}-flat`]: widgetValue === "flat" ? "true" : "false",
         }, params.nullValue);
     },
 
@@ -1566,7 +1569,7 @@ options.registry.OptionsTab = options.Class.extend({
         if (methodName === 'customizeButtonStyle') {
             const isOutline = weUtils.getCSSVariableValue(`btn-${params.button}-outline`);
             const isFlat = weUtils.getCSSVariableValue(`btn-${params.button}-flat`);
-            return isFlat === "'True'" ? 'flat' : isOutline === "'True'" ? 'outline' : 'fill';
+            return isFlat === "true" ? "flat" : isOutline === "true" ? "outline" : "fill";
         }
         return this._super(...arguments);
     },
@@ -2206,6 +2209,8 @@ options.registry.collapse = options.Class.extend({
         const panelId = setUniqueId($panel, 'myCollapseTab');
         $tab.attr('data-bs-target', '#' + panelId);
         $tab.data('bs-target', '#' + panelId);
+
+        $tab[0].setAttribute("aria-controls", panelId);
     },
 });
 
@@ -2949,6 +2954,7 @@ options.registry.CoverProperties = options.Class.extend({
 
         this.$image = this.$target.find('.o_record_cover_image');
         this.$filter = this.$target.find('.o_record_cover_filter');
+        this.rpc = this.bindService("rpc");
     },
     /**
      * @override
@@ -2969,10 +2975,31 @@ options.registry.CoverProperties = options.Class.extend({
      * @see this.selectClass for parameters
      */
     background: async function (previewMode, widgetValue, params) {
+        if (previewMode === false) {
+            this.$image[0].classList.remove("o_b64_image_to_save");
+        }
         if (widgetValue === '') {
             this.$image.css('background-image', '');
             this.$target.removeClass('o_record_has_cover');
         } else {
+            if (previewMode === false) {
+                const imgEl = document.createElement("img");
+                imgEl.src = widgetValue;
+                await loadImageInfo(imgEl, this.rpc);
+                if (imgEl.dataset.mimetype && ![
+                    "image/gif",
+                    "image/svg+xml",
+                    "image/webp",
+                ].includes(imgEl.dataset.mimetype)) {
+                    // Convert to webp but keep original width.
+                    imgEl.dataset.mimetype = "image/webp";
+                    const base64src = await applyModifications(imgEl, {
+                        mimetype: "image/webp",
+                    });
+                    widgetValue = base64src;
+                    this.$image[0].classList.add("o_b64_image_to_save");
+                }
+            }
             this.$image.css('background-image', `url('${widgetValue}')`);
             this.$target.addClass('o_record_has_cover');
             const $defaultSizeBtn = this.$el.find('.o_record_cover_opt_size_default');
@@ -3557,6 +3584,10 @@ options.registry.WebsiteAnimate = options.Class.extend({
             this._toggleImagesLazyLoading(true);
         }
         if (widgetValue === "onHover") {
+            // Pause the history until the hover effect is applied in
+            // "setImgShapeHoverEffect". This prevents saving the intermediate
+            // steps done (in a tricky way) up to that point.
+            this.options.wysiwyg.odooEditor.historyPauseSteps();
             this.trigger_up("option_update", {
                 optionName: "ImageTools",
                 name: "enable_hover_effect",
@@ -3650,8 +3681,7 @@ options.registry.WebsiteAnimate = options.Class.extend({
                     const hoverEffectWidget = hoverEffectOverlayWidget.getParent();
                     const imageToolsOpt = hoverEffectWidget.getParent();
                     return (
-                        !imageToolsOpt._isDeviceShape()
-                        && !imageToolsOpt._isAnimatedShape()
+                        imageToolsOpt._canHaveHoverEffect() && imageToolsOpt._isImageSupportedForShapes()
                         && !await isImageCorsProtected(this.$target[0])
                     );
                 }
@@ -3746,6 +3776,18 @@ options.registry.TextHighlight = options.Class.extend({
     onBlur() {
         this.leftPanelEl.appendChild(this.el);
     },
+    /**
+    * @override
+    */
+    notify(name, data) {
+        // Apply the highlight effect DOM structure when added for the first time
+        // and display the highlight effects grid immediately.
+        if (name === "new_text_highlight") {
+            this._autoAdaptHighlights();
+            this._requestUserValueWidgets("text_highlight_opt")[0]?.enable();
+        }
+        this._super(...arguments);
+    },
 
     //--------------------------------------------------------------------------
     // Options
@@ -3785,21 +3827,19 @@ options.registry.TextHighlight = options.Class.extend({
                 svg.remove();
             });
         } else {
-            applyTextHighlight(this.$target[0], highlightID);
+            this._autoAdaptHighlights();
         }
     },
     /**
-     * @override
+     * Used to set the highlight effect DOM structure on the targeted text
+     * content.
+     *
+     * @private
      */
-    async _computeWidgetState(methodName, params) {
-        const value = await this._super(...arguments);
-        if (methodName === "selectStyle" && value === "currentColor") {
-            const style = window.getComputedStyle(this.$target[0]);
-            // The highlight default color is the text's "currentColor".
-            // This value should be handled correctly by the option.
-            return style.color;
-        }
-        return value;
+    _autoAdaptHighlights() {
+        this.trigger_up("snippet_edition_request", { exec: async () =>
+            await this._refreshPublicWidgets($(this.options.wysiwyg.odooEditor.editable))
+        });
     },
 
     //--------------------------------------------------------------------------
@@ -4086,8 +4126,15 @@ options.registry.GalleryElement = options.Class.extend({
 });
 
 options.registry.Button = options.Class.extend({
-    forceDuplicateButton: true,
-
+    /**
+     * @override
+     */
+    init() {
+        this._super(...arguments);
+        const isUnremovableButton = this.$target[0].classList.contains("oe_unremovable");
+        this.forceDuplicateButton = !isUnremovableButton;
+        this.forceNoDeleteButton = isUnremovableButton;
+    },
     /**
      * @override
      */

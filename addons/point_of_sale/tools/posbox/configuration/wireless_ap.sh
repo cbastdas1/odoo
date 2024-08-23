@@ -10,6 +10,14 @@ if ! [ -f "${WIFI_NETWORK_FILE}" ] && [ -z "${FORCE_HOST_AP}" ] ; then
 	while [ "$(hostname -I)" = '' ] && [ "$COUNTER" -le 10 ]; do sleep 2;((COUNTER++)); done
 fi
 
+# Do we have to use the NetworkManager ?
+current_iotbox_version=$(cat "/var/odoo/iotbox_version")
+required_version="23.11"
+if [[ "$current_iotbox_version" < "$required_version" ]]; then
+    logger -t wireless_ap "USING WPA_SUPPLICANT REMOVING NETWORK MANAGER SERVICE"
+    sudo service NetworkManager stop
+fi
+
 WIRED_IP=$(hostname -I)
 
 if [ "$WIRED_IP" ]; then
@@ -50,13 +58,12 @@ if [ -z "${WIRED_IP}" ] ; then
 		ip addr add 10.11.12.1/24 dev wlan0
 
 		service dnsmasq restart
-
-		service odoo restart
+		service odoo restart # As this file is executed on boot, this line is responsible for restarting odoo service on reboot
 	fi
 # wired
 else
 	killall nginx
 	service nginx restart
 	service dnsmasq stop
-	service odoo restart
+	service odoo restart # As this file is executed on boot, this line is responsible for restarting odoo service on reboot
 fi

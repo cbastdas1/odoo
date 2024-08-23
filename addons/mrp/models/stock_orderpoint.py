@@ -35,6 +35,7 @@ class StockWarehouseOrderpoint(models.Model):
                         'url': f'#action={action.id}&id={production.id}&model=mrp.production'
                     }],
                     'sticky': False,
+                    'next': {'type': 'ir.actions.act_window_close'},
                 }
             }
         return super()._get_replenishment_order_notification()
@@ -104,7 +105,12 @@ class StockWarehouseOrderpoint(models.Model):
         bom_manufacture = self.env['mrp.bom']._bom_find(orderpoints_without_kit.product_id, bom_type='normal')
         bom_manufacture = self.env['mrp.bom'].concat(*bom_manufacture.values())
         productions_group = self.env['mrp.production']._read_group(
-            [('bom_id', 'in', bom_manufacture.ids), ('state', '=', 'draft'), ('orderpoint_id', 'in', orderpoints_without_kit.ids)],
+            [
+                ('bom_id', 'in', bom_manufacture.ids),
+                ('state', '=', 'draft'),
+                ('orderpoint_id', 'in', orderpoints_without_kit.ids),
+                ('id', 'not in', self.env.context.get('ignore_mo_ids', [])),
+            ],
             ['orderpoint_id', 'product_uom_id'],
             ['product_qty:sum'])
         for orderpoint, uom, product_qty_sum in productions_group:
